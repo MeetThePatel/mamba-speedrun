@@ -1,12 +1,13 @@
-import torch
-import torch.nn as nn
-import torch.distributed as dist
-from torch.utils.data import DataLoader
-from torch.nn.parallel import DistributedDataParallel as DDP
 import os
-from mamba_ssm import Mamba2
+import time
 
-from data.dataloader import PAD_TOKEN, DocumentDataset
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+from mamba_ssm import Mamba2
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+from data.dataloader import PAD_TOKEN, MambaDataloader
 
 
 @torch.compile
@@ -114,6 +115,13 @@ class MambaLanguageModel(nn.Module):
     def __init__(self, vocab_size: int, d_model: int, d_state: int, d_conv: int, expand: int, n_layers: int):
         super().__init__()
 
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        self.n_layers = n_layers
+
         assert d_model % expand == 0, "d_model must be divisible by expand."
         headdim = d_model // expand
         assert d_state % headdim == 0, "d_state must be divisible by d_model//expand."
@@ -167,27 +175,85 @@ if __name__ == "__main__":
     optimizer2 = Muon(hidden_matrix_params, lr=0.005, momentum=0.95, rank=rank, world_size=world_size)
     loss_function = torch.nn.CrossEntropyLoss(ignore_index=PAD_TOKEN, reduction="mean")
 
-    dataset = DocumentDataset(filename_pattern="data/fineweb10B/fineweb_train_*.bin", seq_length=1024, batch_size=4, rank=rank, world_size=world_size)
-    dataloader = DataLoader(dataset, batch_size=None, num_workers=0, pin_memory=True)
+    dataloader = MambaDataloader(data_directory="./data/fineweb10B/bucketed", rank=rank, seed=42)
 
+    n_steps = 1000
     step = 0
+    log_interval = 1
+    log_start_time = time.time()
+
     model.train()
 
-    for inputs, targets in dataloader:
-        inputs = inputs.to(device)
-        targets = targets.to(device)
+    while step <= n_steps:
+        batch = dataloader.next_batch(batch_size=256, sequence_length=1024)
+        batch = batch.pin_memory().to(device, non_blocking=True)
 
-        logits = model(inputs)
-        loss = loss_function(logits.view(-1, 50277), targets.view(-1))
+        print(batch.shape)
+        print(batch.sum())
 
+        import sys
+
+        sys.exit(1)
+
+        inputs = batch[:, :-1]
+        targets = batch[:, 1:]
+
+        outputs = model(inputs)
+
+        lhs = outputs.reshape(-1, outputs.size(-1))  # Reshape to [N, C] where N=B*L, C=vocab_size
+        rhs = targets.reshape(-1)  # Reshape to [N]
+
+        # --- DEBUGGING: Inspect the outputs (logits) before loss calculation ---
+        if rank == 0:
+            print(f"--- Debug Step {step} ---")
+            print(f"LHS (outputs) device: {lhs.device}, dtype: {lhs.dtype}, shape: {lhs.shape}")
+            print(f"RHS (targets) device: {rhs.device}, dtype: {rhs.dtype}, shape: {rhs.shape}")
+
+            # Check for NaNs/Infs in the outputs
+            if torch.isnan(lhs).any():
+                print("WARNING: Outputs contain NaNs before loss calculation!")
+            if torch.isinf(lhs).any():
+                print("WARNING: Outputs contain Infs before loss calculation!")
+
+            # Print min/max/mean/std of logits
+            # Use .float() for min/max/mean/std of bfloat16 to avoid potential overflow in these stats themselves
+            print(
+                f"LHS (outputs) stats: min={lhs.min().float().item():.2e}, "
+                f"max={lhs.max().float().item():.2e}, "
+                f"mean={lhs.mean().float().item():.2e}, "
+                f"std={lhs.std().float().item():.2e}"
+            )
+
+            # Check targets range
+            print(f"RHS (targets) stats: min={rhs.min().item()}, max={rhs.max().item()}")
+            if rhs.max().item() >= model.module.vocab_size:
+                print(f"WARNING: Targets contain index >= vocab_size! Max target: {rhs.max().item()}, Vocab size: {model.module.vocab_size}")
+            if rhs.min().item() < 0:
+                print(f"WARNING: Targets contain negative index! Min target: {rhs.min().item()}")
+            print(f"--- End Debug Step {step} ---")
+
+        loss = loss_function(lhs, rhs)
         loss.backward()
+
         optimizer1.step()
         optimizer2.step()
-        model.zero_grad()
 
-        if rank == 0:
-            print(f"Step {step:05d} | Loss {loss.item():.4f}")
+        optimizer1.zero_grad(set_to_none=True)
+        optimizer2.zero_grad(set_to_none=True)
 
         step += 1
+
+        if step % log_interval == 0:
+            # Sync all processes before logging to get accurate timing
+            dist.barrier()
+
+            if rank == 0:
+                elapsed_time = time.time() - log_start_time
+
+                print(f"Step: {step:5d}/{n_steps} | Loss: {loss.item():.3f}")
+
+                total_loss = 0.0
+                total_tokens = 0
+                log_start_time = time.time()
 
     dist.destroy_process_group()

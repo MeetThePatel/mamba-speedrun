@@ -101,9 +101,7 @@ class MambaDataloader:
         padded_batch = [self._pad_document(document, sequence_length) for document in batch_documents]
         batch_tensor = torch.stack(padded_batch)
 
-        inputs = batch_tensor.to(torch.int32)
-        targets = batch_tensor.to(torch.int64)
-        return inputs, targets
+        return batch_tensor.to(torch.int64)
 
 
 def benchmark_dataloader(
