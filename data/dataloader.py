@@ -1,6 +1,7 @@
 import glob
 import time
 from pathlib import Path
+from typing import List
 
 import torch
 from torch.utils.data import DataLoader, IterableDataset
@@ -21,7 +22,7 @@ class DocumentDataset(IterableDataset):
 
         self.local_files = self.files[rank::world_size]
 
-    def _load_data_shard(self, file: Path):
+    def _load_data_shard(self, file: Path) -> torch.Tensor:
         header = torch.from_file(filename=str(file), shared=False, size=256, dtype=torch.int32)
         assert header[0] == 20240520, "Magic number mismatch."
         assert header[1] == 1, "Unsupported version."
@@ -34,7 +35,7 @@ class DocumentDataset(IterableDataset):
             assert nbytes == 2 * num_tokens
         return tokens
 
-    def _split_into_documents(self, tokens: torch.Tensor):
+    def _split_into_documents(self, tokens: torch.Tensor) -> List[torch.Tensor]:
         eod_positions = (tokens == EOD_TOKEN).nonzero(as_tuple=True)[0]
         boundaries = torch.cat([torch.tensor([-1], device=tokens.device), eod_positions, torch.tensor([len(tokens) - 1], device=tokens.device)])
         docs = [tokens[boundaries[i] + 1 : boundaries[i + 1] + 1] for i in range(len(boundaries) - 1)]
