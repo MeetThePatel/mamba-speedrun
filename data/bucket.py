@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 THRESHOLDS = [128, 256, 512, 1024, 2048]
 EOD_TOKEN = 50256
+NUM_SPLITS = 8  # This should be equal to target `world_size`.
 
 
 def _load_data_shard(file: Path) -> np.ndarray:
@@ -311,7 +312,7 @@ def init_output_files(output_dir: Path) -> Dict[int, BufferedWriter]:
     """
     Initialize binary write files for each bucket in the given output directory.
 
-    For each threshold in [128, 256, 512, 1024, 2048], a binary file named `bucket_<threshold>.bin`
+    For each threshold in [128, 256, 512, 1024, 2048] and each split 0-7, a binary file named `bucket_<threshold>_<split>.bin`
     is created in the output directory.
 
     Parameters
@@ -324,8 +325,11 @@ def init_output_files(output_dir: Path) -> Dict[int, BufferedWriter]:
     Dict[int, io.BufferedWriter]
         A dictionary mapping each threshold (bucket key) to its corresponding opened binary file stream.
     """
-    output_paths = {b: output_dir / f"bucket_{b}.bin" for b in THRESHOLDS}
-    output_files = {b: open(path, "wb") for b, path in output_paths.items()}
+    output_files = {}
+    for bucket in THRESHOLDS:
+        for split_id in range(NUM_SPLITS):
+            output_path = output_dir / f"bucket_{bucket}_{split_id}.bin"
+            output_files[(bucket, split_id)] = open(output_path, "wb")
     return output_files
 
 
@@ -353,6 +357,7 @@ def process_and_write_shards(files: List[str], nworkers: int, output_files: Dict
     """
     doc_counts = {b: 0 for b in THRESHOLDS}
     token_counts = {b: 0 for b in THRESHOLDS}
+    split_counters = {b: 0 for b in THRESHOLDS}
     eod_token_np = np.array([EOD_TOKEN], dtype=np.uint16)
 
     with multiprocessing.Pool(processes=nworkers) as pool:
@@ -365,8 +370,12 @@ def process_and_write_shards(files: List[str], nworkers: int, output_files: Dict
                     continue
                 doc_counts[bucket] += len(docs_list)
                 for doc in docs_list:
-                    output_files[bucket].write(doc.tobytes())
-                    output_files[bucket].write(eod_token_np.tobytes())
+                    # Round-robin across splits
+                    split_id = split_counters[bucket] % NUM_SPLITS
+                    split_counters[bucket] += 1
+
+                    output_files[(bucket, split_id)].write(doc.tobytes())
+                    output_files[(bucket, split_id)].write(eod_token_np.tobytes())
                     token_counts[bucket] += len(doc)
 
     return doc_counts, token_counts
@@ -391,6 +400,7 @@ def print_report(document_counts: Dict[int, int], token_counts: Dict[int, int], 
     report_table.add_column("Num Documents", justify="right")
     report_table.add_column("% of Docs", justify="right")
     report_table.add_column("Num Tokens", justify="right")
+    report_table.add_column("Files Created", justify="right")
 
     total_docs = sum(document_counts.values())
     total_tokens = sum(token_counts.values())
@@ -399,12 +409,13 @@ def print_report(document_counts: Dict[int, int], token_counts: Dict[int, int], 
         count = document_counts[bucket]
         tokens = token_counts[bucket]
         percent_docs = (count / total_docs * 100) if total_docs > 0 else 0
-        report_table.add_row(f"{bucket}", f"{count:,}", f"{percent_docs:.2f}%", f"{tokens:,}")
+        files_created = f"bucket_{bucket}_0.bin to bucket_{bucket}_{NUM_SPLITS - 1}.bin"
+        report_table.add_row(f"{bucket}", f"{count:,}", f"{percent_docs:.2f}%", f"{tokens:,}", files_created)
 
-    report_table.add_row("TOTAL", f"{total_docs:,}", "100.00%", f"{total_tokens:,}", style="bold")
+    report_table.add_row("TOTAL", f"{total_docs:,}", "100.00%", f"{total_tokens:,}", f"{len(THRESHOLDS) * NUM_SPLITS} files", style="bold")
 
     console.print(report_table)
-    console.print("Processing finished.")
+    console.print(f"Processing finished. Each bucket was split into {NUM_SPLITS} files.")
 
 
 def main():
