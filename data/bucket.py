@@ -12,7 +12,6 @@ from tqdm import tqdm
 
 THRESHOLDS = [128, 256, 512, 1024, 2048]
 EOD_TOKEN = 50256
-NUM_SPLITS = 8  # This should be equal to target `world_size`.
 
 
 def _load_data_shard(file: Path) -> np.ndarray:
@@ -308,7 +307,7 @@ def setup_output_directory(output_dir: str) -> Path:
     return output_dir_path
 
 
-def init_output_files(output_dir: Path) -> Dict[int, BufferedWriter]:
+def init_output_files(output_dir: Path, world_size: int) -> Dict[int, BufferedWriter]:
     """
     Initialize binary write files for each bucket in the given output directory.
 
@@ -319,6 +318,8 @@ def init_output_files(output_dir: Path) -> Dict[int, BufferedWriter]:
     ----------
     output_dir : pathlib.Path
         Directory where the bucket files will be created.
+    world_size : int
+        World size for training run.
 
     Returns
     -------
@@ -327,13 +328,15 @@ def init_output_files(output_dir: Path) -> Dict[int, BufferedWriter]:
     """
     output_files = {}
     for bucket in THRESHOLDS:
-        for split_id in range(NUM_SPLITS):
+        for split_id in range(world_size):
             output_path = output_dir / f"bucket_{bucket}_{split_id}.bin"
             output_files[(bucket, split_id)] = open(output_path, "wb")
     return output_files
 
 
-def process_and_write_shards(files: List[str], nworkers: int, output_files: Dict[int, BufferedWriter]) -> Tuple[Dict[int, int], Dict[int, int]]:
+def process_and_write_shards(
+    files: List[str], nworkers: int, output_files: Dict[int, BufferedWriter], world_size: int
+) -> Tuple[Dict[int, int], Dict[int, int]]:
     """
     Process input shards in parallel and write grouped documents into respective bucket files.
 
@@ -348,6 +351,8 @@ def process_and_write_shards(files: List[str], nworkers: int, output_files: Dict
         Number of worker processes.
     output_files : Dict[int, io.BufferedWriter]
         Dictionary mapping bucket thresholds to pre-opened binary output files.
+    world_size : int
+        World size for training run.
 
     Returns
     -------
@@ -371,7 +376,7 @@ def process_and_write_shards(files: List[str], nworkers: int, output_files: Dict
                 doc_counts[bucket] += len(docs_list)
                 for doc in docs_list:
                     # Round-robin across splits
-                    split_id = split_counters[bucket] % NUM_SPLITS
+                    split_id = split_counters[bucket] % world_size
                     split_counters[bucket] += 1
 
                     output_files[(bucket, split_id)].write(doc.tobytes())
@@ -381,7 +386,7 @@ def process_and_write_shards(files: List[str], nworkers: int, output_files: Dict
     return doc_counts, token_counts
 
 
-def print_report(document_counts: Dict[int, int], token_counts: Dict[int, int], console: Console):
+def print_report(document_counts: Dict[int, int], token_counts: Dict[int, int], world_size: int, console: Console):
     """
     Print a formatted report showing document and token counts per bucket.
 
@@ -391,6 +396,8 @@ def print_report(document_counts: Dict[int, int], token_counts: Dict[int, int], 
         Dictionary mapping each bucket to the number of documents written.
     token_counts : Dict[int, int]
         Dictionary mapping each bucket to the number of tokens written.
+    world_size : int
+        World size for training run.
     console : rich.console.Console
         A Console instance used to render the output.
     """
@@ -409,13 +416,13 @@ def print_report(document_counts: Dict[int, int], token_counts: Dict[int, int], 
         count = document_counts[bucket]
         tokens = token_counts[bucket]
         percent_docs = (count / total_docs * 100) if total_docs > 0 else 0
-        files_created = f"bucket_{bucket}_0.bin to bucket_{bucket}_{NUM_SPLITS - 1}.bin"
+        files_created = f"bucket_{bucket}_0.bin to bucket_{bucket}_{world_size - 1}.bin"
         report_table.add_row(f"{bucket}", f"{count:,}", f"{percent_docs:.2f}%", f"{tokens:,}", files_created)
 
-    report_table.add_row("TOTAL", f"{total_docs:,}", "100.00%", f"{total_tokens:,}", f"{len(THRESHOLDS) * NUM_SPLITS} files", style="bold")
+    report_table.add_row("TOTAL", f"{total_docs:,}", "100.00%", f"{total_tokens:,}", f"{len(THRESHOLDS) * world_size} files", style="bold")
 
     console.print(report_table)
-    console.print(f"Processing finished. Each bucket was split into {NUM_SPLITS} files.")
+    console.print(f"Processing finished. Each bucket was split into {world_size} files.")
 
 
 def main():
@@ -429,6 +436,7 @@ def main():
 
     bucket_parser = subparsers.add_parser("bucket", help="Group and bucket documents by length.")
     bucket_parser.add_argument("--file_pattern", type=str, required=True, help="Glob pattern for shard files")
+    bucket_parser.add_argument("--world_size", type=int, required=True, help="World size for training run")
     bucket_parser.add_argument("--nworkers", type=int, default=4)
     bucket_parser.add_argument("--output_dir", type=str, required=True, help="Output directory for bucketed binary files")
 
@@ -450,10 +458,10 @@ def main():
             console.print(f"[red]Error: no files found for pattern '{args.file_pattern}'[/red]")
             return
         output_dir = setup_output_directory(args.output_dir)
-        output_files = init_output_files(output_dir)
+        output_files = init_output_files(output_dir, args.world_size)
         try:
-            doc_counts, token_counts = process_and_write_shards(files, args.nworkers, output_files)
-            print_report(doc_counts, token_counts, console)
+            doc_counts, token_counts = process_and_write_shards(files, args.nworkers, output_files, args.world_size)
+            print_report(doc_counts, token_counts, args.world_size, console)
         finally:
             for f in output_files.values():
                 f.close()
