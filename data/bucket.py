@@ -1,5 +1,6 @@
 import argparse
 import glob
+import json
 import multiprocessing
 from io import BufferedWriter
 from pathlib import Path
@@ -307,7 +308,7 @@ def setup_output_directory(output_dir: str) -> Path:
     return output_dir_path
 
 
-def init_output_files(output_dir: Path, world_size: int) -> Dict[int, BufferedWriter]:
+def init_output_files(output_dir: Path, world_size: int) -> Tuple[Dict[Tuple[int, int], BufferedWriter], List[str]]:
     """
     Initialize binary write files for each bucket in the given output directory.
 
@@ -323,20 +324,24 @@ def init_output_files(output_dir: Path, world_size: int) -> Dict[int, BufferedWr
 
     Returns
     -------
-    Dict[int, io.BufferedWriter]
-        A dictionary mapping each threshold (bucket key) to its corresponding opened binary file stream.
+    Tuple[Dict[Tuple[int, int], io.BufferedWriter], List[str]]
+        A tuple containing a dictionary mapping each threshold (bucket key) + split_id pair to its corresponding opened
+        binary file stream, and a list of filenames.
     """
-    output_files = {}
+    output_files: Dict[Tuple[int, int], BufferedWriter] = {}
+    filenames: List[str] = []
     for bucket in THRESHOLDS:
         for split_id in range(world_size):
-            output_path = output_dir / f"bucket_{bucket}_{split_id}.bin"
+            filename = f"bucket_{bucket}_{split_id}.bin"
+            filenames.append(filename)
+            output_path = output_dir / filename
             output_files[(bucket, split_id)] = open(output_path, "wb")
-    return output_files
+    return output_files, filename
 
 
 def process_and_write_shards(
     files: List[str], nworkers: int, output_files: Dict[int, BufferedWriter], world_size: int
-) -> Tuple[Dict[int, int], Dict[int, int]]:
+) -> Tuple[Dict[int, int], Dict[int, int], Dict[str, int]]:
     """
     Process input shards in parallel and write grouped documents into respective bucket files.
 
@@ -356,14 +361,16 @@ def process_and_write_shards(
 
     Returns
     -------
-    Tuple[Dict[int, int], Dict[int, int]]
+    Tuple[Dict[int, int], Dict[int, int], Dict[str, int]]
         - First dict maps each bucket to the number of documents written.
         - Second dict maps each bucket to the total number of tokens written.
+        - Third dict maps each filename to token count.
     """
     doc_counts = {b: 0 for b in THRESHOLDS}
     token_counts = {b: 0 for b in THRESHOLDS}
     split_counters = {b: 0 for b in THRESHOLDS}
     eod_token_np = np.array([EOD_TOKEN], dtype=np.uint16)
+    file_token_counts = {}
 
     with multiprocessing.Pool(processes=nworkers) as pool:
         pbar = tqdm(pool.imap_unordered(process_shard, files), total=len(files), desc="Processing shards")
@@ -378,12 +385,20 @@ def process_and_write_shards(
                     # Round-robin across splits
                     split_id = split_counters[bucket] % world_size
                     split_counters[bucket] += 1
+                    filename = f"bucket_{bucket}_{split_id}.bin"
 
                     output_files[(bucket, split_id)].write(doc.tobytes())
                     output_files[(bucket, split_id)].write(eod_token_np.tobytes())
                     token_counts[bucket] += len(doc)
+                    file_token_counts[filename] = file_token_counts.get(filename, 0) + len(doc)
 
-    return doc_counts, token_counts
+    return doc_counts, token_counts, file_token_counts
+
+
+def write_metadata_file(output_dir: Path, file_mapping: Dict[str, int]):
+    metadata_path = output_dir / "metadata.json"
+    with open(metadata_path, "w") as f:
+        json.dump(file_mapping, f, indent=2)
 
 
 def print_report(document_counts: Dict[int, int], token_counts: Dict[int, int], world_size: int, console: Console):
@@ -458,9 +473,10 @@ def main():
             console.print(f"[red]Error: no files found for pattern '{args.file_pattern}'[/red]")
             return
         output_dir = setup_output_directory(args.output_dir)
-        output_files = init_output_files(output_dir, args.world_size)
+        output_files, all_filenames = init_output_files(output_dir, args.world_size)
         try:
-            doc_counts, token_counts = process_and_write_shards(files, args.nworkers, output_files, args.world_size)
+            doc_counts, token_counts, file_token_counts = process_and_write_shards(files, args.nworkers, output_files, args.world_size)
+            write_metadata_file(output_dir, file_token_counts)
             print_report(doc_counts, token_counts, args.world_size, console)
         finally:
             for f in output_files.values():

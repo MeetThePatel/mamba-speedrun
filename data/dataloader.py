@@ -1,4 +1,5 @@
 import glob
+import json
 import re
 import time
 from pathlib import Path
@@ -14,7 +15,7 @@ PAD_TOKEN = 0
 
 class MambaDataloader:
     def __init__(self, data_directory: str, rank: int, seed: Optional[int] = None):
-        self.data_directory = data_directory
+        self.data_directory = Path(data_directory)
         self.rank = rank
         self.seed = seed
 
@@ -23,6 +24,8 @@ class MambaDataloader:
         self.generator = None
         if self.seed is not None:
             self.generator = torch.Generator().manual_seed(self.seed)
+
+        self.metadata = self._load_metadata()
 
         all_files = glob.glob(str(Path(self.data_directory) / "*.bin"))
         file_pattern = re.compile(r"bucket_(\d+)_(\d+)\.bin")
@@ -34,7 +37,8 @@ class MambaDataloader:
             sequence_length, file_rank = int(match.group(1)), int(match.group(2))
 
             if file_rank == self.rank:
-                tokens = self._load_data_shard(Path(file_path_str))
+                filename = Path(file_path_str).name
+                tokens = self._load_data_shard(Path(file_path_str), self.metadata[filename])
                 documents = self._split_into_documents(tokens)
                 if documents:
                     self.data[sequence_length] = self._shuffle_documents(documents)
@@ -42,6 +46,13 @@ class MambaDataloader:
 
         if not self.data:
             raise RuntimeError(f"No data files found for rank {self.rank} in directory {self.data_directory}.")
+
+    def _load_metadata(self) -> Dict[str, int]:
+        metadata_path = self.data_directory / "metadata.json"
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"Metadata file not found at {metadata_path}.")
+        with open(metadata_path, "r") as f:
+            return json.load(f)
 
     def _shuffle_documents(self, documents: List[torch.Tensor]) -> List[torch.Tensor]:
         if not documents:
@@ -51,8 +62,8 @@ class MambaDataloader:
         perm = torch.randperm(num_documents, generator=self.generator)
         return [documents[i] for i in perm]
 
-    def _load_data_shard(self, file: Path) -> torch.Tensor:
-        tokens = torch.from_file(filename=str(file), shared=False, dtype=torch.uint16)
+    def _load_data_shard(self, file: Path, n_tokens: int) -> torch.Tensor:
+        tokens = torch.from_file(filename=str(file), shared=False, size=n_tokens, dtype=torch.uint16)
         return tokens
 
     def _split_into_documents(self, tokens: torch.Tensor) -> List[torch.Tensor]:
@@ -69,14 +80,14 @@ class MambaDataloader:
     def _pad_document(self, document: torch.Tensor, sequence_length: int) -> torch.Tensor:
         document_length = len(document)
         if document_length > sequence_length:
-            return document[:sequence_length]
+            return document[-sequence_length:]
         elif document_length < sequence_length:
             padding = torch.full((sequence_length - document_length,), PAD_TOKEN, dtype=document.dtype)
-            return torch.cat([document, padding])
+            return torch.cat([padding, document])
         else:
             return document
 
-    def next_batch(self, batch_size: int, sequence_length: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def next_batch(self, batch_size: int, sequence_length: int) -> torch.Tensor:
         if sequence_length not in self.data:
             raise ValueError(f"No data for sequence_length={sequence_length}. Available: {list(self.data.keys())}")
 
@@ -127,18 +138,16 @@ def benchmark_dataloader(
         torch.cuda.synchronize()
         start = time.time()
 
-        inputs_cpu, targets_cpu = dataloader.next_batch(batch_size=batch_size, sequence_length=sequence_length)
-        inputs = inputs_cpu.pin_memory().to(device, non_blocking=True)
-        targets = targets_cpu.pin_memory().to(device, non_blocking=True)
+        batch_cpu = dataloader.next_batch(batch_size=batch_size, sequence_length=sequence_length)
+        batch = batch_cpu.pin_memory().to(device, non_blocking=True)
 
-        inputs.sum()
-        targets.sum()
+        batch.sum()  # Dummy op
 
         torch.cuda.synchronize()
         end = time.time()
 
         times.append(end - start)
-        total_tokens += inputs.numel()
+        total_tokens += batch.numel()
 
     if len(times) > 1:
         times = times[1:]
