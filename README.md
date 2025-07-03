@@ -7,5 +7,5 @@ uv pip install --no-build-isolation "git+https://github.com/Dao-AILab/causal-con
 
 Next, we install `mamba-ssm`:
 ```
-uv pip install --system --no-build-isolation "git+https://github.com/state-spaces/mamba@v2.2.4"
+uv pip install --no-build-isolation "git+https://github.com/state-spaces/mamba@v2.2.4"
 ```

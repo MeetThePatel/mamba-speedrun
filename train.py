@@ -160,9 +160,11 @@ if __name__ == "__main__":
     world_size = dist.get_world_size()
     device = torch.device("cuda", rank)
 
-    model = MambaLanguageModel(vocab_size=50277, d_model=512, d_state=256, d_conv=4, expand=2, n_layers=8)
+    model = MambaLanguageModel(vocab_size=50277, d_model=512, d_state=768, d_conv=4, expand=4, n_layers=16)
     model.to(device)
     model = DDP(model, device_ids=[rank])
+
+    print(f"{sum(p.numel() for p in model.module.parameters()):,}")
 
     hidden_matrix_params = [p for n, p in model.module.named_parameters() if p.ndim >= 2 and "embed" not in n]
 
@@ -171,68 +173,36 @@ if __name__ == "__main__":
     head_params = [model.module.out_projection.weight]
     adam_params = [dict(params=head_params, lr=0.003), dict(params=embed_params, lr=0.003), dict(params=scalar_params, lr=0.003)]
 
-    optimizer1 = torch.optim.Adam(adam_params, fused=True)
-    optimizer2 = Muon(hidden_matrix_params, lr=0.005, momentum=0.95, rank=rank, world_size=world_size)
-    loss_function = torch.nn.CrossEntropyLoss(ignore_index=PAD_TOKEN, reduction="mean")
+    optimizer1 = torch.optim.Adam(adam_params, eps=1e-10, amsgrad=True, fused=True)
+    optimizer2 = Muon(hidden_matrix_params, lr=0.004, momentum=0.95, rank=rank, world_size=world_size)
+    loss_function = torch.nn.CrossEntropyLoss(ignore_index=PAD_TOKEN, reduction="sum")
 
-    dataloader = MambaDataloader(data_directory="./data/fineweb10B/bucketed", rank=rank, seed=42)
+    dataloader = MambaDataloader(data_directory="./data/fineweb10B_bucketed", rank=rank, seed=42)
 
-    n_steps = 1000
+    n_steps = 10000
     step = 0
     log_interval = 1
-    log_start_time = time.time()
+
+    total_train_start_time = time.perf_counter()
+    log_start_time = time.perf_counter()
 
     model.train()
 
     while step <= n_steps:
-        batch = dataloader.next_batch(batch_size=256, sequence_length=1024)
+        step_start_time = time.perf_counter()
+
+        batch = dataloader.next_batch(batch_size=16, sequence_length=512)
         batch = batch.pin_memory().to(device, non_blocking=True)
-
-        print(batch.shape)
-        print(batch.sum())
-
-        import sys
-
-        sys.exit(1)
 
         inputs = batch[:, :-1]
         targets = batch[:, 1:]
 
-        outputs = model(inputs)
+        outputs: torch.Tensor = model(inputs)
 
         lhs = outputs.reshape(-1, outputs.size(-1))  # Reshape to [N, C] where N=B*L, C=vocab_size
         rhs = targets.reshape(-1)  # Reshape to [N]
 
-        # --- DEBUGGING: Inspect the outputs (logits) before loss calculation ---
-        if rank == 0:
-            print(f"--- Debug Step {step} ---")
-            print(f"LHS (outputs) device: {lhs.device}, dtype: {lhs.dtype}, shape: {lhs.shape}")
-            print(f"RHS (targets) device: {rhs.device}, dtype: {rhs.dtype}, shape: {rhs.shape}")
-
-            # Check for NaNs/Infs in the outputs
-            if torch.isnan(lhs).any():
-                print("WARNING: Outputs contain NaNs before loss calculation!")
-            if torch.isinf(lhs).any():
-                print("WARNING: Outputs contain Infs before loss calculation!")
-
-            # Print min/max/mean/std of logits
-            # Use .float() for min/max/mean/std of bfloat16 to avoid potential overflow in these stats themselves
-            print(
-                f"LHS (outputs) stats: min={lhs.min().float().item():.2e}, "
-                f"max={lhs.max().float().item():.2e}, "
-                f"mean={lhs.mean().float().item():.2e}, "
-                f"std={lhs.std().float().item():.2e}"
-            )
-
-            # Check targets range
-            print(f"RHS (targets) stats: min={rhs.min().item()}, max={rhs.max().item()}")
-            if rhs.max().item() >= model.module.vocab_size:
-                print(f"WARNING: Targets contain index >= vocab_size! Max target: {rhs.max().item()}, Vocab size: {model.module.vocab_size}")
-            if rhs.min().item() < 0:
-                print(f"WARNING: Targets contain negative index! Min target: {rhs.min().item()}")
-            print(f"--- End Debug Step {step} ---")
-
-        loss = loss_function(lhs, rhs)
+        loss: torch.Tensor = loss_function(lhs, rhs)
         loss.backward()
 
         optimizer1.step()
@@ -244,16 +214,17 @@ if __name__ == "__main__":
         step += 1
 
         if step % log_interval == 0:
-            # Sync all processes before logging to get accurate timing
             dist.barrier()
 
             if rank == 0:
-                elapsed_time = time.time() - log_start_time
+                step_elapsed = time.perf_counter() - step_start_time
+                total_elapsed = time.perf_counter() - total_train_start_time
 
-                print(f"Step: {step:5d}/{n_steps} | Loss: {loss.item():.3f}")
-
-                total_loss = 0.0
-                total_tokens = 0
-                log_start_time = time.time()
+                print(
+                    f"Step: {step:5d}/{n_steps} | "
+                    f"Loss: {loss.item():.3f} | "
+                    f"Step Time: {step_elapsed * 1000:.3f} ms | "
+                    f"Total Train Time: {total_elapsed:.3f} s"
+                )
 
     dist.destroy_process_group()

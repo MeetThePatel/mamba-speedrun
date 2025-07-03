@@ -10,3 +10,5 @@ wheels/
 .venv
 
 data/fineweb10B
+data/**/*.bin
+data/**/metadata.json
